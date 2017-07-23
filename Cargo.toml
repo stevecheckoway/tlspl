@@ -1,0 +1,7 @@
+[package]
+name = "tlspl"
+version = "0.1.0"
+authors = ["Stephen Checkoway <s@pahtak.org>"]
+
+[dependencies]
+nom = "^3.1"
