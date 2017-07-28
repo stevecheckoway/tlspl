@@ -5,9 +5,9 @@ use nom::{is_alphabetic, is_alphanumeric, digit, hex_u32};
 pub type Identifier = String;
 
 #[derive(Debug, PartialEq, Eq)]
-pub struct QualifiedName {
-    structure: Identifier,
-    field: Identifier,
+pub enum Name {
+    Simple(Identifier),
+    Qualified(Identifier, Identifier), // structure, field
 }
 
 // The TLS presentation language has two built-in types, `opaque` and `uint8`.
@@ -21,8 +21,7 @@ pub struct QualifiedName {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Constant {
     Literal(u32),
-    Named(Identifier),
-    Qualified(QualifiedName),
+    Named(Name),
 }
 
 // impl Constant {
@@ -37,8 +36,8 @@ pub enum Constant {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Range {
-    lower: u32,
-    upper: u32,
+    pub lower: u32,
+    pub upper: u32,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -58,15 +57,21 @@ pub enum FieldType {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct FieldDecl {
-    base: Identifier, // Base type.
-    name: Identifier, // Field name.
-    typ:  FieldType,  // Type of field.
+    pub base: Identifier, // Base type.
+    pub name: Identifier, // Field name.
+    pub typ:  FieldType,  // Type of field.
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct VariantDecl {
-    qname: QualifiedName,
-    cases: Vec<(Identifier, FieldDecl)>,
+    pub selector: Name,
+    pub cases: Vec<(Identifier, FieldDecl)>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum StructElement {
+    Field(FieldDecl),
+    Variant(VariantDecl),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -87,15 +92,14 @@ pub enum TypeDeclType {
         max: Option<u32>,
     },
     Struct {
-        fields: Vec<FieldDecl>,
-        variant: Option<VariantDecl>,
+        fields: Vec<StructElement>,
     },
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct TypeDecl {
-    name: Identifier,
-    typ: TypeDeclType,
+    pub name: Identifier,
+    pub typ: TypeDeclType,
 }
 
 // The TLS 1.3 presentation language is described in Section 3 of
@@ -117,14 +121,12 @@ named!(identifier<Identifier>,
                  str::from_utf8),
         String::from_str));
 
-named!(qualified_name<QualifiedName>,
-       do_parse!(structure: identifier >>
-                 char!('.')            >>
-                 field: identifier     >>
-                 (QualifiedName {
-                     structure: structure,
-                     field: field,
-                 })));
+named!(name<Name>,
+    do_parse!(
+        structure: identifier >>
+        field:     opt!(preceded!(char!('.'), identifier)) >>
+        (match field { None        => Name::Simple(structure),
+                       Some(field) => Name::Qualified(structure, field) })));
 
 // Number expressions. These aren't specified in the standard.
 // Recognize decimal and hexadecimal numbers.
@@ -143,9 +145,8 @@ named!(num_expr<u32>,
          number));
 
 named!(constant<Constant>,
-    alt!(map!(qualified_name, Constant::Qualified) |
-         map!(identifier,     Constant::Named) |
-         map!(num_expr,       Constant::Literal)));
+    alt!(map!(name,     Constant::Named) |
+         map!(num_expr, Constant::Literal)));
 
 // Range expressions. These aren't specified in the standard but lower..upper is
 // appears several times.
@@ -163,14 +164,16 @@ named!(comment,
 
 // Make our own whitespace parser to consume spaces, tabs, carriage returns,
 // newlines, and comments.
-named!(pub space,
-       recognize!(many1!(alt!(eat_separator!(&b" \t\r\n"[..]) | comment))));
+named!(comment_space,
+    recognize!(
+        preceded!(eat_separator!(&b" \t\r\n"[..]),
+                  many0!(terminated!(comment, eat_separator!(&b" \t\r\n"[..]))))));
 
 #[macro_export]
 macro_rules! sp (
     ($i:expr, $($args:tt)*) => (
         {
-            sep!($i, space, $($args)*)
+            sep!($i, comment_space, $($args)*)
         }
     )
 );
@@ -310,30 +313,30 @@ named!(case_stmt<(Identifier, FieldDecl)>,
 named!(select_stmt<VariantDecl>,
        sp!(do_parse!(tag!("select")           >>
                      char!('(')               >>
-                     qname: qualified_name    >>
+                     selector: name           >>
                      char!(')')               >>
                      char!('{')               >>
                      cases: many1!(case_stmt) >>
                      char!('}')               >>
                      char!(';')               >>
                      (VariantDecl {
-                         qname: qname,
-                         cases: cases,
+                         selector: selector,
+                         cases:    cases,
                      }))));
 
 named!(struct_decl<TypeDecl>,
-       sp!(do_parse!(tag!("struct")             >>
-                     char!('{')                 >>
-                     fields: many0!(field_decl) >>
-                     variant: opt!(select_stmt) >>
-                     char!('}')                 >>
-                     name: identifier           >>
-                     char!(';')                 >>
+       sp!(do_parse!(tag!("struct")                  >>
+                     char!('{')                      >>
+                     fields: sp!(many0!(alt!(
+                                map!(select_stmt, StructElement::Variant) |
+                                map!(field_decl,  StructElement::Field)))) >>
+                     char!('}')                      >>
+                     name: identifier                >>
+                     char!(';')                      >>
                      (TypeDecl {
                         name: name,
                         typ: TypeDeclType::Struct {
                             fields: fields,
-                            variant: variant,
                         },
                      }))));
 
@@ -344,26 +347,12 @@ named!(type_decl<TypeDecl>,
              variable_vector_decl |
              alias_decl)));
 
-named!(type_decls<Vec<TypeDecl>>, sp!(many1!(type_decl)));
+named!(type_decls<Vec<TypeDecl>>, sp!(many0!(type_decl)));
 
-pub fn parse_types(input: &str) -> Result<Vec<TypeDecl>, String> {
+pub fn parse_types(input: &str) -> Result<(Vec<TypeDecl>, &str), String> {
     use nom::IResult;
     match complete!(input.as_bytes(), sp!(type_decls)) {
-        IResult::Done(rest, types) => {
-            if rest != &[][..] {
-                let num = types.len();
-                let parsed_types = types.into_iter()
-                    .map(|decl| decl.name)
-                    .collect::<Vec<String>>()
-                    .join(", ");
-                let msg = format!("Successfully parsed {} types (", num).to_string() +
-                    &parsed_types + ") but could not parse\n" +
-                    str::from_utf8(rest).unwrap();
-                Err(msg)
-            } else {
-                Ok(types)
-            }
-        },
+        IResult::Done(rest, types) => Ok((types, str::from_utf8(rest).unwrap())),
         IResult::Error(err)        => Err(format!("{}", err)),
         IResult::Incomplete(_)     => panic!("Incomplete?!?"),
     }
@@ -372,13 +361,38 @@ pub fn parse_types(input: &str) -> Result<Vec<TypeDecl>, String> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use nom::IResult;
+    use nom::{IResult, Err};
+    //use std::error::Error;
+    
+    fn convert_vec<E>(v: Vec<Err<&[u8], E>>) -> Vec<Err<&str, E>> {
+        v.into_iter()
+            .map(convert_err)
+            .collect()
+    }
+
+    fn convert_err<E>(err : Err<&[u8], E>) -> Err<&str, E> {
+        match err {
+            Err::Code(k) => Err::Code(k),
+            Err::Node(k, v) => Err::Node(k, convert_vec(v)),
+            Err::Position(k, p) => Err::Position(k, str::from_utf8(p).unwrap()),
+            Err::NodePosition(k, p, v) => Err::NodePosition(k, str::from_utf8(p).unwrap(),
+                                                            convert_vec(v)),
+        }
+    }
+
+    fn convert_result<O,E>(res: IResult<&[u8],O,E>) -> IResult<&str,O,E> {
+        match res {
+            IResult::Done(i, o)    => IResult::Done(str::from_utf8(i).unwrap(), o),
+            IResult::Error(e)      => IResult::Error(convert_err(e)),
+            IResult::Incomplete(n) => IResult::Incomplete(n),
+        }
+    }
 
     macro_rules! assert_parse {
         ($res: expr, $expected: expr) => {
-            match $res {
-                IResult::Done(i, actual) => assert_eq!((str::from_utf8(i).unwrap(),actual), ("", $expected)),
-                IResult::Error(e)        => panic!(format!("{}", e)),
+            match convert_result($res) {
+                IResult::Done(i, actual) => assert_eq!((i,actual), ("", $expected)),
+                IResult::Error(e)        => panic!(format!("{:?}", e)),
                 IResult::Incomplete(n)   => panic!(format!("{:?}", n)),
             }
         };
@@ -408,6 +422,8 @@ mod test {
     fn check_comment() {
         assert!(comment(b"/* foo * bar */").is_done());
         assert!(comment(b"/**/").is_done());
+        assert_parse!(sp!(&b"/*before*/X /* between */\t\r\n /*asf*/ Y /*after*/"[..], pair!(char!('X'), char!('Y'))),
+                      ('X', 'Y'));
     
         assert!(!comment(b"/*/").is_done());
     }
@@ -466,7 +482,7 @@ mod test {
                 max: None,
             },
         };
-        assert_parse!(type_decl(b" enum { red(3), blue(5), white(7) } Color;"), color);
+        assert_parse!(enum_decl(b" enum { red(3), blue(5), white(7) } Color;"), color);
         let taste = TypeDecl {
             name: "Taste".to_string(),
             typ: TypeDeclType::Enum {
@@ -476,7 +492,7 @@ mod test {
                 max: Some(32000),
             },
         };
-        assert_parse!(type_decl(b"enum { sweet(1), sour(2), bitter(4), (32000) } Taste;"), taste);
+        assert_parse!(enum_decl(b"enum { sweet(1), sour(2), bitter(4), (32000) } Taste;"), taste);
         let reserved = TypeDecl {
             name: "Reserved".to_string(),
             typ: TypeDeclType::Enum {
@@ -485,11 +501,82 @@ mod test {
                 max: Some(65535),
             },
         };
-        assert_parse!(type_decl(b"enum { foo(1), reserved(300..400), (65535) } Reserved;"), reserved);
+        assert_parse!(enum_decl(b"enum { foo(1), reserved(300..400), (65535) } Reserved;"), reserved);
     }
 
     #[test]
-    fn check_parse() {
+    fn check_struct_decl() {
+        let v1 = TypeDecl {
+            name: "V1".to_string(),
+            typ:  TypeDeclType::Struct {
+                fields: vec![
+                    StructElement::Field(FieldDecl {
+                        base: "uint16".to_string(),
+                        name: "number".to_string(),
+                        typ:  FieldType::ScalarType,
+                    }),
+                    StructElement::Field(FieldDecl {
+                        base: "opaque".to_string(),
+                        name: "string".to_string(),
+                        typ:  FieldType::VariableVectorType(Range {lower: 0, upper: 10}),
+                    })
+                ],
+            },
+        };
+        let v1_str = b"struct {
+    uint16 number;
+    opaque string<0..10>; /* variable length */
+} V1;";
+        assert_parse!(struct_decl(v1_str), v1);
+        let v2 = TypeDecl {
+            name: "V2".to_string(),
+            typ:  TypeDeclType::Struct {
+                fields: vec![
+                    StructElement::Field(FieldDecl {
+                        base: "uint32".to_string(),
+                        name: "number".to_string(),
+                        typ:  FieldType::ScalarType,
+                    }),
+                    StructElement::Field(FieldDecl {
+                        base: "opaque".to_string(),
+                        name: "string".to_string(),
+                        typ:  FieldType::FixedVectorType(Constant::Literal(10)),
+                    })
+                ],
+            },
+        };
+        let v2_str = b"struct {
+    uint32 number;
+    opaque string[10];     /* fixed length */
+} V2;";
+        assert_parse!(struct_decl(v2_str), v2);
+        let variant_record = TypeDecl {
+            name: "VariantRecord".to_string(),
+            typ:  TypeDeclType::Struct {
+                fields: vec![
+                    StructElement::Field(FieldDecl {
+                        base: "VariantTag".to_string(),
+                        name: "type".to_string(),
+                        typ:  FieldType::ScalarType,
+                    }),
+                    StructElement::Variant(VariantDecl {
+                        selector: Name::Qualified("VariantRecord".to_string(), "type".to_string()),
+                        cases:    vec![
+                            ("apple".to_string(),  FieldDecl { base: "V1".to_string(), name: String::new(), typ: FieldType::ScalarType }),
+                            ("orange".to_string(), FieldDecl { base: "V2".to_string(), name: String::new(), typ: FieldType::ScalarType })
+                        ],
+                    }),
+                ],
+            }
+        };
+        let vr_str = b"struct {
+    VariantTag type;
+    select (VariantRecord.type) {
+        case apple:  V1;
+        case orange: V2;
+    };
+} VariantRecord;";
+        assert_parse!(struct_decl(vr_str), variant_record);
     }
 }
 

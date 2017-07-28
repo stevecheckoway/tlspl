@@ -67,12 +67,19 @@ fn main() {
     for (line_num, text) in definitions {
         match parse_types(&text) {
             Err(err) => {
-                println!("Failed to parse block starting on line {}:\n---\n{}\n---\n{}",
-                         line_num, text, err);
+                println!("{}:{} Parser returned an error: {}", path, line_num, err);
             },
-            Ok(types) => {
-                for typ in types.iter() {
-                    println!("{:?}", typ);
+            Ok((types, rest)) => {
+                if !types.is_empty() {
+                    println!("From line {}, parsed:", line_num);
+                    for typ in types.iter() {
+                        //println!("{:#?}", typ);
+                        println!("\t{}", typ.name);
+                    }
+                }
+                if !rest.is_empty() {
+                    println!("From line {}, failed to parse:\n{}",
+                             line_num, rest);
                 }
             }
         };
